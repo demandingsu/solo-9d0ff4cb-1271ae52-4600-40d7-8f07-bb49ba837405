@@ -17,6 +17,8 @@ from urllib.parse import urljoin, urlparse, urldefrag
 import requests
 from bs4 import BeautifulSoup
 
+from rules import FIELD_LABELS, FIELD_ORDER
+
 MAX_PAGES = 50          # 分页抓取上限，防止死循环或异常站点
 REQUEST_TIMEOUT = 10    # 单次请求超时（秒）
 USER_AGENT = "membrane-procurement-bot/1.0"
@@ -69,7 +71,7 @@ def _same_site(url: str, netloc: str) -> bool:
     return urlparse(url).netloc == netloc
 
 
-def _get_soup(session: requests.Session, url: str) -> BeautifulSoup:
+def fetch_soup(session: requests.Session, url: str) -> BeautifulSoup:
     try:
         resp = session.get(url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
@@ -119,14 +121,87 @@ def _to_fen(num_str: str) -> int:
     return int((d * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def parse_detail_page(url: str, soup: BeautifulSoup) -> OfferInfo:
-    """解析详情页：型号、每包片数、含税包价、可购包数。缺关键字段视为解析失败。"""
+def parse_field_value(field: str, raw: str):
+    """把节点文本解析为字段的规范值；无法解析返回 None。
+
+    model      -> 归一化型号串；pack_size/stock_packs -> int；pack_price -> 分（int）
+    """
+    if field == "model":
+        return normalize_model(raw) or None
+    m = NUM_RE.search(raw)
+    if not m:
+        return None
+    if field == "pack_price":
+        return _to_fen(m.group(1))
+    try:
+        return int(m.group(1).replace(",", ""))
+    except ValueError:
+        return None  # 片数/包数须为整数，小数文本视为无法解析
+
+
+def extract_field_candidates(soup: BeautifulSoup, selector: str, field: str):
+    """返回选择器命中的 (节点原文, 解析值) 去重列表；空文本与无法解析的节点忽略。
+
+    发布核对与严格规则解析共用：空列表 = 缺字段；多于一个不同值 = 多值冲突。
+    """
+    out: list[tuple[str, object]] = []
+    for el in soup.select(selector):
+        raw = el.get_text(" ", strip=True)
+        if not raw:
+            continue
+        val = parse_field_value(field, raw)
+        if val is None:
+            continue
+        if all(val != v for _, v in out):
+            out.append((raw, val))
+    return out
+
+
+def _parse_with_strict_rule(url: str, soup: BeautifulSoup, rule, title: str) -> OfferInfo:
+    """按已启用规则的四个 CSS 选择器严格抽取；缺字段或多值冲突即解析失败。
+
+    不做任何启发式回退——改版后旧节点可能残留过期数据，回退会造成错误报价。
+    """
+    values: dict[str, tuple[str, object]] = {}
+    for field in FIELD_ORDER:
+        selector = rule.selectors.get(field, "")
+        cands = extract_field_candidates(soup, selector, field)
+        label = FIELD_LABELS[field]
+        if not cands:
+            raise ScrapeError(
+                f"详情页解析失败 {url}: 规则 v{rule.version} 选择器 '{selector}' 未取到{label}"
+            )
+        if len(cands) > 1:
+            raws = "、".join(repr(r) for r, _ in cands)
+            raise ScrapeError(
+                f"详情页解析失败 {url}: 规则 v{rule.version} 选择器 '{selector}' 命中多个冲突的{label}（{raws}）"
+            )
+        values[field] = cands[0]
+    return OfferInfo(
+        detail_url=url,
+        title=title,
+        model=values["model"][0],            # 节点原文，便于展示
+        pack_size=values["pack_size"][1],    # type: ignore[arg-type]
+        price_fen=values["pack_price"][1],   # type: ignore[arg-type]
+        stock_packs=values["stock_packs"][1],  # type: ignore[arg-type]
+    )
+
+
+def parse_detail_page(url: str, soup: BeautifulSoup, rule=None) -> OfferInfo:
+    """解析详情页：型号、每包片数、含税包价、可购包数。缺关键字段视为解析失败。
+
+    rule 为已启用的站点规则（报价开始时从快照固定）：strict 规则只用其选择器
+    严格抽取；rule 为 None 或非 strict（内置默认 v1）时走启发式 + 正则回退。
+    """
     page_text = soup.get_text("\n", strip=True)
 
-    title = _pick_text(soup, ["h1.product-title", "h1"])
+    title = _pick_text(soup, ["h1.product-title", "h1.pdp-title", "h1"])
     if not title and soup.title:
         title = soup.title.get_text(strip=True)
     title = title or ""
+
+    if rule is not None and getattr(rule, "strict", False):
+        return _parse_with_strict_rule(url, soup, rule, title)
 
     model = _pick_text(soup, [".product-model", ".model", '[data-field="model"]'])
     if not model:
@@ -136,8 +211,7 @@ def parse_detail_page(url: str, soup: BeautifulSoup) -> OfferInfo:
     pack_size = None
     raw = _pick_text(soup, [".pack-size", '[data-field="pack-size"]'])
     if raw:
-        m = NUM_RE.search(raw)
-        pack_size = int(m.group(1).replace(",", "")) if m else None
+        pack_size = parse_field_value("pack_size", raw)
     if pack_size is None:
         m = re.search(r"每包片数\s*[:：]?\s*(\d+)", page_text) or re.search(r"(\d+)\s*片\s*/\s*包", page_text)
         pack_size = int(m.group(1)) if m else None
@@ -154,8 +228,7 @@ def parse_detail_page(url: str, soup: BeautifulSoup) -> OfferInfo:
     stock_packs = None
     raw = _pick_text(soup, [".stock-packs", ".stock", '[data-field="stock"]'])
     if raw:
-        m = NUM_RE.search(raw)
-        stock_packs = int(m.group(1).replace(",", "")) if m else None
+        stock_packs = parse_field_value("stock_packs", raw)
     if stock_packs is None:
         m = re.search(r"可购包数\s*[:：]?\s*(\d+)", page_text)
         stock_packs = int(m.group(1)) if m else None
@@ -178,8 +251,13 @@ def parse_detail_page(url: str, soup: BeautifulSoup) -> OfferInfo:
     )
 
 
-def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
-    """抓取目录分页并收集匹配型号的详情。列表页抓取失败会抛 ScrapeError。"""
+def crawl_catalog(catalog_url: str, model: str, rules=None) -> CrawlResult:
+    """抓取目录分页并收集匹配型号的详情。列表页抓取失败会抛 ScrapeError。
+
+    rules 为报价开始时固定的规则快照（含 resolve(url)）；传 None 时全部走
+    内置默认启发式解析。整个抓取过程只使用这一次传入的快照，即使中途有
+    新规则发布，也不会混用新旧字段。
+    """
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     netloc = urlparse(catalog_url).netloc
@@ -194,7 +272,7 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
     seen_pages: set[str] = set()
     while url and url not in seen_pages and len(list_pages) < MAX_PAGES:
         seen_pages.add(url)
-        soup = _get_soup(session, url)  # 列表页失败：整个目录不可用，直接抛错
+        soup = fetch_soup(session, url)  # 列表页失败：整个目录不可用，直接抛错
         list_pages.append(url)
         for a in _product_links(soup):
             href = a.get("href")
@@ -219,9 +297,11 @@ def crawl_catalog(catalog_url: str, model: str) -> CrawlResult:
     failed: list[str] = []
     unverified: list[str] = []
     for detail_url, _text in candidates:
+        # 每个详情页都用同一快照解析：版本在报价开始时已固定
+        rule = rules.resolve(detail_url) if rules is not None else None
         try:
-            soup = _get_soup(session, detail_url)
-            offer = parse_detail_page(detail_url, soup)
+            soup = fetch_soup(session, detail_url)
+            offer = parse_detail_page(detail_url, soup, rule)
         except ScrapeError:
             if fallback_scan:
                 # 兜底扫描时无法确认该页是否匹配，单独记录为"未能核对"
