@@ -1,0 +1,19 @@
+services:
+  api:
+    build: ./app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - sample-site
+    environment:
+      # 容器网络内样本站地址（调用 API 时 catalog_url 用 http://sample-site:8080/）
+      SAMPLE_CATALOG_URL: http://sample-site:8080/
+
+  sample-site:
+    # 与 api 共用同一基础镜像，避免额外拉取镜像
+    image: python:3.12-slim
+    command: ["python", "-m", "http.server", "8080", "--directory", "/site"]
+    volumes:
+      - ./sample_site:/site:ro
+    ports:
+      - "8080:8080"
